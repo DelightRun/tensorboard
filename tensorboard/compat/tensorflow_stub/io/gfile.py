@@ -35,6 +35,13 @@ try:
 except ImportError:
     S3_ENABLED = False
 
+try:
+    import oss2
+
+    OSS_ENABLED = True
+except ImportError:
+    OSS_ENABLED = False
+
 if sys.version_info < (3, 0):
     # In Python 2 FileExistsError is not defined and the
     # error manifests it as OSError.
@@ -400,10 +407,222 @@ class S3FileSystem(object):
             else:
                 raise
 
+class OSSFileSystem(object):
+    """Provides filesystem access to OSS."""
+
+    def __init__(self):
+        if not oss2:
+            raise ImportError("oss2 must be installed for OSS support.")
+
+    def bucket_and_path(self, url):
+        path = compat.as_str_any(url)
+
+        if path.startswith("oss://"):
+            path = path[len("oss://"):]
+
+        configs = {
+            "endpoint": os.getenv("TB_OSS_ENDPOINT", os.getenv("OSS_ENDPOINT", None)),
+            "accessKeyID": os.getenv("TB_OSS_ACCESS_KEY_ID", os.getenv("OSS_ACCESS_KEY_ID", None)),
+            "accessKeySecret": os.getenv("TB_OSS_ACCESS_KEY_SECRET", os.getenv("OSS_ACCESS_KEY_SECRET", None)),
+            "securityToken": os.getenv("TB_OSS_SECURITY_TOKEN", os.getenv("OSS_SECURITY_TOKEN", None)),
+        }
+
+        bucket, path = path.split('/', maxsplit=1)
+        if '?' in bucket:
+            bucket, config = bucket.split('?', maxsplit=1)
+            for pair in config.split('&'):
+                k, v = pair.split('=', maxsplit=1)
+                configs[k] = v
+
+        access_key_id = configs["accessKeyID"]
+        access_key_secret = configs["accessKeySecret"]
+        security_token = configs["securityToken"]
+        endpoint = configs["endpoint"]
+
+        if access_key_id is None or access_key_secret is None:
+            auth = oss2.AnonymousAuth()
+        elif security_token is not None:
+            auth = oss2.StsAuth(access_key_id, access_key_secret, security_token)
+        else:
+            auth = oss2.Auth(access_key_id, access_key_secret)
+
+        bucket = oss2.Bucket(auth, endpoint, bucket)
+
+        return bucket, path
+
+    def exists(self, filename):
+        """Determines whether a path exists or not."""
+        bucket, path = self.bucket_and_path(filename)
+        r = bucket.list_objects(prefix=path, delimiter="/", max_keys=2)
+        if r.object_list or r.prefix_list:
+            return True
+        return False
+
+    def join(self, path, *paths):
+        """Join paths with a slash."""
+        return "/".join((path,) + paths)
+
+    def read(self, filename, binary_mode=False, size=None, continue_from=None):
+        """Reads contents of a file to a string.
+
+        Args:
+            filename: string, a path
+            binary_mode: bool, read as binary if True, otherwise text
+            size: int, number of bytes or characters to read, otherwise
+                read all the contents of the file (from the continuation
+                marker, if present).
+            continue_from: An opaque value returned from a prior invocation of
+                `read(...)` marking the last read position, so that reading
+                may continue from there.  Otherwise read from the beginning.
+
+        Returns:
+            A tuple of `(data, continuation_token)` where `data' provides either
+            bytes read from the file (if `binary_mode == true`) or the decoded
+            string representation thereof (otherwise), and `continuation_token`
+            is an opaque value that can be passed to the next invocation of
+            `read(...) ' in order to continue from the last read position.
+        """
+        bucket, path = self.bucket_and_path(filename)
+        byte_range = None
+
+        # Get file content length
+        meta = bucket.get_object_meta(path)
+        length = int(meta.headers['Content-Length'])
+
+        # For the OSS case, we use continuation tokens of the form
+        # {byte_offset: number}
+        offset = 0
+        if continue_from is not None:
+            offset = continue_from.get("byte_offset", 0)
+
+        if size is None:
+            size = length - offset + 1
+
+        # TODO(orionr): This endpoint risks splitting a multi-byte
+        # character or splitting \r and \n in the case of CRLFs,
+        # producing decoding errors below.
+        endpoint = min(offset + size, length) - 1
+
+        if offset <= endpoint < length:
+            # Asked for a range, so pass the range
+            byte_range = (offset, endpoint)
+
+            stream = bucket.get_object(path, byte_range=byte_range).read()
+        else:
+            stream = b""
+
+        # `stream` should contain raw bytes here (i.e., there has been neither
+        # decoding nor newline translation), so the byte offset increases by
+        # the expected amount.
+        continuation_token = {"byte_offset": (offset + len(stream))}
+        if binary_mode:
+            return (bytes(stream), continuation_token)
+        else:
+            return (stream.decode("utf-8"), continuation_token)
+
+    def write(self, filename, file_content, binary_mode=False):
+        """Writes string file contents to a file.
+
+        Args:
+            filename: string, a path
+            file_content: string, the contents
+            binary_mode: bool, write as binary if True, otherwise text
+        """
+        bucket, path = self.bucket_and_path(filename)
+        # Always convert to bytes for writing
+        if binary_mode:
+            if not isinstance(file_content, six.binary_type):
+                raise TypeError("File content type must be bytes")
+        else:
+            file_content = compat.as_bytes(file_content)
+        bucket.put_object(path, file_content)
+
+    def glob(self, filename):
+        """Returns a list of files that match the given pattern(s)."""
+        # Only support prefix with * at the end and no ? in the string
+        star_i = filename.find("*")
+        quest_i = filename.find("?")
+        if quest_i >= 0:
+            raise NotImplementedError(
+                "{} not supported by compat glob".format(filename)
+            )
+        postfix = filename[star_i+1:]
+        filename = filename[:star_i]
+        bucket, path = self.bucket_and_path(filename)
+        keys = []
+        # The following instruction is copied from OSS document.
+        # 通过delimiter和prefix两个参数可以模拟文件夹功能：
+        # + 如果设置prefix为某个文件夹名称，则会列举以此prefix开头的文件，即该文件夹下所有的文件和子文件夹（目录）。
+        # + 如果再设置delimiter为正斜线（/），则只列举该文件夹下的文件和子文件夹（目录）名称，子文件夹下的文件和文件夹不显示。
+        for o in oss2.ObjectIterator(bucket, prefix=path):
+            key = o.key[len(path):]
+            # Since o.is_prefix() will always return False
+            # if we set param `delimiter` of `ObjectIterator`
+            # to empty, we have to use tailing '/' to identity
+            # the directories.
+            if key and key.endswith(postfix):
+                keys.append(filename + key)
+        return keys
+
+    def isdir(self, dirname):
+        """Returns whether the path is a directory or not."""
+        bucket, path = self.bucket_and_path(dirname)
+        if not path.endswith("/"):
+            path += "/"  # This will now only retrieve subdir content
+        r = bucket.list_objects(prefix=path, delimiter="/", max_keys=2)
+        if r.object_list or r.prefix_list:
+            return True
+        return False
+
+    def listdir(self, dirname):
+        """Returns a list of entries contained within a directory."""
+        bucket, path = self.bucket_and_path(dirname)
+        if not path.endswith("/"):
+            path += "/"  # This will now only retrieve subdir content
+        keys = []
+        # The following instruction is copied from OSS document.
+        # 通过delimiter和prefix两个参数可以模拟文件夹功能：
+        # + 如果设置prefix为某个文件夹名称，则会列举以此prefix开头的文件，即该文件夹下所有的文件和子文件夹（目录）。
+        # + 如果再设置delimiter为正斜线（/），则只列举该文件夹下的文件和子文件夹（目录）名称，子文件夹下的文件和文件夹不显示。
+        for o in oss2.ObjectIterator(bucket, prefix=path, delimiter='/'):
+            key = o.key[len(path):]
+            # Since we set param `delimiter` to '/', o.is_prefix() will
+            # return True if it is a directory.
+            if o.is_prefix():
+                keys.append(key[:-1])
+            elif key:
+                keys.append(key)
+        return keys
+
+    def makedirs(self, dirname):
+        """Creates a directory and all parent/intermediate directories."""
+        if self.exists(dirname):
+            raise errors.AlreadyExistsError(
+                None, None, "Directory already exists"
+            )
+        bucket, path = self.bucket_and_path(dirname)
+        if not path.endswith("/"):
+            path += "/"  # This will make sure we don't override a file
+        bucket.put_object(path, "")
+
+    def stat(self, filename):
+        """Returns file statistics for a given path."""
+        # NOTE: Size of the file is given by ContentLength from S3,
+        # but we convert to .length
+        bucket, path = self.bucket_and_path(filename)
+        try:
+            meta = bucket.get_object_meta(path)
+            length = int(meta.headers['Content-Length'])
+            return StatData(length)
+        except oss2.exceptions.NoSuchKey:
+            raise errors.NotFoundError(None, None, "Could not find file")
+
 
 register_filesystem("", LocalFileSystem())
 if S3_ENABLED:
     register_filesystem("s3", S3FileSystem())
+if OSS_ENABLED:
+    register_filesystem("oss", OSSFileSystem())
 
 
 class GFile(object):

@@ -59,3 +59,21 @@ py_test(
         "//tensorboard:test",
     ],
 )
+
+py_test(
+    name = "gfile_oss_test",
+    size = "small",
+    srcs = ["io/gfile_oss_test.py"],
+    srcs_version = "PY2AND3",
+    args = [
+        "-v"
+    ],
+    tags = [
+        "manual",
+        "notap",
+    ],
+    deps = [
+        ":tensorflow_stub",
+        "//tensorboard:test",
+    ],
+)
